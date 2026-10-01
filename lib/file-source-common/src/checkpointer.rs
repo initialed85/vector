@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File},
@@ -55,12 +55,29 @@ pub struct CheckpointsView {
     checkpoints: DashMap<FileFingerprint, FilePosition>,
     modified_times: DashMap<FileFingerprint, DateTime<Utc>>,
     removed_times: DashMap<FileFingerprint, DateTime<Utc>>,
+    /// Fingerprints the file server currently has a watcher for. Only these are treated as alive
+    /// by `update`; see `set_watched`.
+    watched: DashSet<FileFingerprint>,
 }
 
 impl CheckpointsView {
     pub fn update(&self, fng: FileFingerprint, pos: FilePosition) {
         self.checkpoints.insert(fng, pos);
         self.modified_times.insert(fng, Utc::now());
+        // Positions are committed when the event is consumed downstream (or acknowledged, with
+        // end-to-end acknowledgements), not when the line is read, so an update can arrive after
+        // the file server has stopped watching the file and marked it dead. Only a file that is
+        // still being watched counts as alive here - otherwise that late update would clear the
+        // dead marker and the checkpoint would never expire.
+        if self.watched.contains(&fng) {
+            self.removed_times.remove(&fng);
+        }
+    }
+
+    /// Called by the file server when it starts watching a file. This is what keeps (or brings
+    /// back) a checkpoint as alive, including one that was marked dead and has since reappeared.
+    pub fn set_watched(&self, fng: FileFingerprint) {
+        self.watched.insert(fng);
         self.removed_times.remove(&fng);
     }
 
@@ -69,6 +86,7 @@ impl CheckpointsView {
     }
 
     pub fn set_dead(&self, fng: FileFingerprint) {
+        self.watched.remove(&fng);
         self.removed_times.insert(fng, Utc::now());
     }
 
@@ -83,6 +101,10 @@ impl CheckpointsView {
 
         if let Some((_, value)) = self.removed_times.remove(&old) {
             self.removed_times.insert(new, value);
+        }
+
+        if self.watched.remove(&old).is_some() {
+            self.watched.insert(new);
         }
     }
 
@@ -447,7 +469,9 @@ mod test {
             assert_eq!(chkptr.get_checkpoint(fingerprint), Some(position));
         }
 
-        // Update one that would otherwise be expired to ensure it sticks around
+        // Watch one that would otherwise be expired (its file reappeared) and update it, to ensure
+        // it sticks around
+        chkptr.checkpoints.set_watched(cases[2].0);
         chkptr.update_checkpoint(cases[2].0, 42);
 
         // Expiration is piggybacked on the persistence interval, so do a write to trigger it
@@ -457,6 +481,53 @@ mod test {
         assert_eq!(chkptr.get_checkpoint(cases[1].0), None);
         assert_eq!(chkptr.get_checkpoint(cases[2].0), Some(42));
         assert_eq!(chkptr.get_checkpoint(cases[3].0), None);
+    }
+
+    #[tokio::test]
+    async fn test_checkpointer_late_update_does_not_revive_dead_file() {
+        let fingerprint = FileFingerprint::FirstLinesChecksum(424_242);
+        let data_dir = tempdir().unwrap();
+        let mut chkptr = Checkpointer::new(data_dir.path());
+
+        // the file server watches the file, lines are read and committed
+        chkptr.checkpoints.set_watched(fingerprint);
+        chkptr.update_checkpoint(fingerprint, 100);
+
+        // the file is rotated away and the file server stops watching it (back-dated past the
+        // grace period so we don't have to sleep)...
+        chkptr.checkpoints.set_dead(fingerprint);
+        chkptr
+            .checkpoints
+            .removed_times
+            .insert(fingerprint, Utc::now() - chrono::Duration::seconds(61));
+
+        // ...but the position for its last lines is only committed afterwards, when downstream
+        // catches up
+        chkptr.update_checkpoint(fingerprint, 200);
+        assert_eq!(chkptr.get_checkpoint(fingerprint), Some(200));
+
+        // that late update must not have revived it, so it still expires
+        chkptr.write_checkpoints().await.unwrap();
+        assert_eq!(chkptr.get_checkpoint(fingerprint), None);
+    }
+
+    #[tokio::test]
+    async fn test_checkpointer_rewatched_file_is_revived() {
+        let fingerprint = FileFingerprint::FirstLinesChecksum(434_343);
+        let data_dir = tempdir().unwrap();
+        let mut chkptr = Checkpointer::new(data_dir.path());
+
+        chkptr.checkpoints.set_watched(fingerprint);
+        chkptr.update_checkpoint(fingerprint, 100);
+        chkptr.checkpoints.set_dead(fingerprint);
+
+        // the file reappears (e.g. renamed back into the glob) and is watched again
+        chkptr.checkpoints.set_watched(fingerprint);
+        chkptr.update_checkpoint(fingerprint, 150);
+
+        // so it is alive and must not expire
+        chkptr.write_checkpoints().await.unwrap();
+        assert_eq!(chkptr.get_checkpoint(fingerprint), Some(150));
     }
 
     #[tokio::test]

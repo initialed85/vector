@@ -483,6 +483,7 @@ where
                 }
                 watcher.set_file_findable(true);
                 fp_map.insert(file_id, watcher);
+                checkpoints.set_watched(file_id);
             }
             Err(error) => self.emitter.emit_file_watch_error(&path, error),
         };
